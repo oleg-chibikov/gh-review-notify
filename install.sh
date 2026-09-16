@@ -16,6 +16,7 @@ die() { echo "$1" >&2; exit 1; }
 [ "$(uname)" = "Darwin" ] || die "macOS only."
 command -v gh > /dev/null || die "Install the GitHub CLI first: brew install gh"
 gh auth status > /dev/null 2>&1 || die "Log in first: gh auth login"
+command -v brew > /dev/null || die "Homebrew is missing: see https://brew.sh"
 
 if ! command -v jq > /dev/null; then
   echo "Installing jq..."

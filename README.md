@@ -88,9 +88,9 @@ curl -fsSL https://raw.githubusercontent.com/oleg-chibikov/gh-review-notify/main
 ## When nothing arrives
 
 ```sh
-launchctl list | grep gh-review-notify   # third column is the label, second is the last exit code
+gh-review-notify --status   # agent, account, last run, settings
+gh-review-notify --test     # checks the macOS side only
 tail ~/Library/Logs/gh-review-notify.log
-gh-review-notify --test                  # checks only the macOS side
 ```
 
 A user agent runs while you are logged in and sleeps with the Mac. On wake it

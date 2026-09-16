@@ -25,6 +25,16 @@ if [ "${1:-}" = "--test" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "--status" ]; then
+  agent=$(launchctl list 2> /dev/null | awk '$3 == "io.github.gh-review-notify" { print "running, last exit code " $2 }')
+  echo "agent:    ${agent:-not loaded, run install.sh}"
+  echo "account:  $(gh api user --jq .login 2> /dev/null || echo 'gh is not logged in')"
+  echo "last run: $(stat -f %Sm "$state_dir/pr-updated.tsv" 2> /dev/null || echo never)"
+  echo "seen:     $( (wc -l < "$state" 2> /dev/null || echo 0) | tr -d ' ') events, looking $days days back, bots=$bots"
+  echo "log:      $HOME/Library/Logs/gh-review-notify.log"
+  exit 0
+fi
+
 command -v gh > /dev/null || { echo "gh is not installed" >&2; exit 1; }
 command -v jq > /dev/null || { echo "jq is not installed" >&2; exit 1; }
 
@@ -58,7 +68,7 @@ since=$(date -u -v-"${days}"d +%Y-%m-%dT%H:%M:%SZ)
 day=$(date -u -v-"${days}"d +%Y-%m-%d)
 
 search_prs() {
-  gh search prs "$@" --state open --updated ">=$day" --limit 30 --json url,title,updatedAt
+  gh search prs "$@" --state open --updated ">=$day" --limit 100 --json url,title,updatedAt
 }
 
 requested_from_me() {
@@ -76,7 +86,7 @@ requested_from_me() {
 # review-requested also matches a request sent to a team you belong to, so every
 # hit is checked for your own name on the PR. The answer is kept until the pull
 # request changes again.
-gh search prs --review-requested @me --state open --limit 30 --json url,title,author,updatedAt --jq \
+gh search prs --review-requested @me --state open --limit 100 --json url,title,author,updatedAt --jq \
   '.[] | [.url, .title, .author.login, .updatedAt] | @tsv' > "$tmp/requested.tsv" 2> /dev/null
 
 : > "$tmp/personal.tsv"
@@ -98,50 +108,58 @@ sort -t$'\t' -k1,1 -u "$tmp/base.tsv" "$tmp/personal.tsv" > "$tmp/prs.tsv"
 
 : > "$tmp/updated.tsv"
 while IFS=$'\t' read -r url title updated; do
-  printf '%s\t%s\n' "$url" "$updated" >> "$tmp/updated.tsv"
   # Nothing happened on this pull request since the last look.
-  [ "$(lookup "$cache_updated" "$url" 2)" = "$updated" ] && continue
+  if [ "$(lookup "$cache_updated" "$url" 2)" = "$updated" ]; then
+    printf '%s\t%s\n' "$url" "$updated" >> "$tmp/updated.tsv"
+    continue
+  fi
 
   path=${url#https://github.com/}
   repo=${path%/pull/*}
   num=${path##*/}
   pr="${repo#*/}#$num"
 
+  ok=1
+  gh api "repos/$repo/pulls/$num/reviews" > "$tmp/reviews.json" 2> /dev/null || ok=0
+  gh api "repos/$repo/issues/$num/comments?since=$since&per_page=100" > "$tmp/issue.json" 2> /dev/null || ok=0
+  gh api "repos/$repo/pulls/$num/comments?since=$since&per_page=100" > "$tmp/inline.json" 2> /dev/null || ok=0
+
   # An empty COMMENTED review is only the wrapper around inline comments, which
   # are reported one by one below.
   {
-    gh api "repos/$repo/pulls/$num/reviews" 2> /dev/null |
-      jq -r --arg me "$me" --arg since "$since" --arg pr "$pr" --arg t "$title" --arg bots "$bots" '
-        .[]
-        | select(.user.login != $me and .submitted_at > $since)
-        | select($bots == "1" or .user.type != "Bot")
-        | select(.state != "COMMENTED" or (.body // "") != "")
-        | [ .html_url,
-            .user.login + " " + (
-              if .state == "APPROVED" then "approved"
-              elif .state == "CHANGES_REQUESTED" then "requested changes on"
-              else "reviewed" end) + " " + $pr,
-            (if (.body // "") == "" then $t else .body[0:150] end) ]
-        | @tsv'
+    jq -r --arg me "$me" --arg since "$since" --arg pr "$pr" --arg t "$title" --arg bots "$bots" '
+      .[]
+      | select(.user.login != $me and .submitted_at > $since)
+      | select($bots == "1" or .user.type != "Bot")
+      | select(.state != "COMMENTED" or (.body // "") != "")
+      | [ .html_url,
+          .user.login + " " + (
+            if .state == "APPROVED" then "approved"
+            elif .state == "CHANGES_REQUESTED" then "requested changes on"
+            else "reviewed" end) + " " + $pr,
+          (if (.body // "") == "" then $t else .body[0:150] end) ]
+      | @tsv' "$tmp/reviews.json" 2> /dev/null
 
     # Comments on the conversation tab.
-    gh api "repos/$repo/issues/$num/comments?since=$since&per_page=100" 2> /dev/null |
-      jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
-        .[]
-        | select(.user.login != $me)
-        | select($bots == "1" or .user.type != "Bot")
-        | [.html_url, .user.login + " commented on " + $pr, .body[0:150]]
-        | @tsv'
+    jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
+      .[]
+      | select(.user.login != $me)
+      | select($bots == "1" or .user.type != "Bot")
+      | [.html_url, .user.login + " commented on " + $pr, .body[0:150]]
+      | @tsv' "$tmp/issue.json" 2> /dev/null
 
     # Inline comments on the diff.
-    gh api "repos/$repo/pulls/$num/comments?since=$since&per_page=100" 2> /dev/null |
-      jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
-        .[]
-        | select(.user.login != $me)
-        | select($bots == "1" or .user.type != "Bot")
-        | [.html_url, .user.login + " commented on " + $pr, (.path // "") + ": " + .body[0:120]]
-        | @tsv'
+    jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
+      .[]
+      | select(.user.login != $me)
+      | select($bots == "1" or .user.type != "Bot")
+      | [.html_url, .user.login + " commented on " + $pr, (.path // "") + ": " + .body[0:120]]
+      | @tsv' "$tmp/inline.json" 2> /dev/null
   } >> "$events"
+
+  # A failed call means the comments are still unread, so the PR is left out of
+  # the cache and looked at again next time.
+  [ "$ok" = 1 ] && printf '%s\t%s\n' "$url" "$updated" >> "$tmp/updated.tsv"
 done < "$tmp/prs.tsv"
 mv "$tmp/updated.tsv" "$cache_updated"
 
