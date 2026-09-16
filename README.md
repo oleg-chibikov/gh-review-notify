@@ -30,10 +30,16 @@ exact comment, e.g. `.../pull/42#discussion_r123`.
 
 What it stays quiet about:
 
+- bots. CodeRabbit, Semgrep and friends leave dozens of comments and drown out
+  the people. Set `GH_REVIEW_NOTIFY_BOTS=1` to hear them.
 - reviews asked of a team you belong to. GitHub search counts those as
   `review-requested:@me`, which is how most of the noise gets in. Every hit is
   checked against `requested_reviewers` on the PR, so only your own name counts.
 - your own comments, closed PRs, CI results.
+
+A reviewer who leaves ten inline comments at once gets one notification, not
+ten: more than four new items on the same PR collapse into "7 new comments on
+api-users#570" with the names underneath.
 
 The first run records the last 3 days without a sound, so you don't get a wall
 of old notifications. Seen items live in `~/.cache/gh-review-notify/seen.txt`.
@@ -63,15 +69,18 @@ up, switch on **System Settings > Notifications > terminal-notifier** and run
 
 ## Settings
 
-Both are read at install time:
+All three are read when you install, and written into the agent:
 
 ```sh
 GH_REVIEW_NOTIFY_INTERVAL=60 ./install.sh   # poll every 60 seconds, default 180
 GH_REVIEW_NOTIFY_DAYS=7 ./install.sh        # look 7 days back, default 3
+GH_REVIEW_NOTIFY_BOTS=1 ./install.sh        # bot comments too, default off
 ```
 
-A run takes about a minute on 20 open pull requests and costs roughly 100 API
-calls, against a limit of 5000 an hour.
+The first run reads every pull request you take part in and takes about a
+minute. After that each run only opens the ones whose `updatedAt` moved, so the
+usual run is under 10 seconds and a handful of API calls, against a limit of
+5000 an hour.
 
 ## Uninstall
 

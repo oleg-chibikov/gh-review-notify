@@ -4,6 +4,8 @@ set -euo pipefail
 repo_raw=${GH_REVIEW_NOTIFY_SRC:-https://raw.githubusercontent.com/oleg-chibikov/gh-review-notify/main}
 label=io.github.gh-review-notify
 interval=${GH_REVIEW_NOTIFY_INTERVAL:-180}
+days=${GH_REVIEW_NOTIFY_DAYS:-3}
+bots=${GH_REVIEW_NOTIFY_BOTS:-0}
 bin_dir="$HOME/.local/bin"
 script="$bin_dir/gh-review-notify"
 plist="$HOME/Library/LaunchAgents/$label.plist"
@@ -55,6 +57,13 @@ cat > "$plist" << PLIST
 	</array>
 	<key>StartInterval</key>
 	<integer>$interval</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>GH_REVIEW_NOTIFY_DAYS</key>
+		<string>$days</string>
+		<key>GH_REVIEW_NOTIFY_BOTS</key>
+		<string>$bots</string>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>
@@ -65,7 +74,7 @@ cat > "$plist" << PLIST
 </plist>
 PLIST
 
-echo "Reading your last few days of pull requests, this takes about a minute..."
+echo "Reading your pull requests..."
 "$script" || die "The first run failed. See $log"
 
 launchctl bootout "gui/$(id -u)/$label" 2> /dev/null || true

@@ -6,6 +6,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export GH_PAGER=cat
 
 days=${GH_REVIEW_NOTIFY_DAYS:-3}
+bots=${GH_REVIEW_NOTIFY_BOTS:-0}
 state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/gh-review-notify"
 state="$state_dir/seen.txt"
 
@@ -34,17 +35,30 @@ if [ ! -f "$state" ]; then
   : > "$state"
 fi
 
+# One run at a time, so a manual run and the agent can't report the same comment.
+lock="$state_dir/lock"
+find "$lock" -maxdepth 0 -mmin +15 -exec rmdir {} \; 2> /dev/null
+mkdir "$lock" 2> /dev/null || exit 0
+
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "$lock"' EXIT
 events="$tmp/events.tsv"
 : > "$events"
+
+cache_updated="$state_dir/pr-updated.tsv"
+cache_requests="$state_dir/review-requests.tsv"
+touch "$cache_updated" "$cache_requests"
+
+lookup() { # file, url, column
+  awk -F'\t' -v u="$2" -v c="$3" '$1 == u { print $c; exit }' "$1"
+}
 
 me=$(gh api user --jq .login) || { echo "gh is not logged in: run gh auth login" >&2; exit 1; }
 since=$(date -u -v-"${days}"d +%Y-%m-%dT%H:%M:%SZ)
 day=$(date -u -v-"${days}"d +%Y-%m-%d)
 
 search_prs() {
-  gh search prs "$@" --state open --updated ">=$day" --limit 30 --json url,title
+  gh search prs "$@" --state open --updated ">=$day" --limit 30 --json url,title,updatedAt
 }
 
 requested_from_me() {
@@ -57,23 +71,37 @@ requested_from_me() {
   search_prs --author @me
   search_prs --involves @me
   search_prs --reviewed-by @me
-} 2> /dev/null | jq -rs 'add | unique_by(.url) | .[] | [.url, .title] | @tsv' > "$tmp/base.tsv"
+} 2> /dev/null | jq -rs 'add | unique_by(.url) | .[] | [.url, .title, .updatedAt] | @tsv' > "$tmp/base.tsv"
 
 # review-requested also matches a request sent to a team you belong to, so every
-# hit is checked for your own name on the PR.
-gh search prs --review-requested @me --state open --limit 30 --json url,title,author --jq \
-  '.[] | [.url, .title, .author.login] | @tsv' > "$tmp/requested.tsv" 2> /dev/null
+# hit is checked for your own name on the PR. The answer is kept until the pull
+# request changes again.
+gh search prs --review-requested @me --state open --limit 30 --json url,title,author,updatedAt --jq \
+  '.[] | [.url, .title, .author.login, .updatedAt] | @tsv' > "$tmp/requested.tsv" 2> /dev/null
 
 : > "$tmp/personal.tsv"
-while IFS=$'\t' read -r url title author; do
-  requested_from_me "$url" || continue
-  printf '%s\t%s\n' "$url" "$title" >> "$tmp/personal.tsv"
+: > "$tmp/requests.tsv"
+while IFS=$'\t' read -r url title author updated; do
+  verdict=""
+  [ "$(lookup "$cache_requests" "$url" 2)" = "$updated" ] && verdict=$(lookup "$cache_requests" "$url" 3)
+  if [ -z "$verdict" ]; then
+    if requested_from_me "$url"; then verdict=personal; else verdict=team; fi
+  fi
+  printf '%s\t%s\t%s\n' "$url" "$updated" "$verdict" >> "$tmp/requests.tsv"
+  [ "$verdict" = "personal" ] || continue
+  printf '%s\t%s\t%s\n' "$url" "$title" "$updated" >> "$tmp/personal.tsv"
   printf '%s#review-requested\tReview requested by %s\t%s\n' "$url" "$author" "$title" >> "$events"
 done < "$tmp/requested.tsv"
+mv "$tmp/requests.tsv" "$cache_requests"
 
-sort -u "$tmp/base.tsv" "$tmp/personal.tsv" > "$tmp/prs.tsv"
+sort -t$'\t' -k1,1 -u "$tmp/base.tsv" "$tmp/personal.tsv" > "$tmp/prs.tsv"
 
-while IFS=$'\t' read -r url title; do
+: > "$tmp/updated.tsv"
+while IFS=$'\t' read -r url title updated; do
+  printf '%s\t%s\n' "$url" "$updated" >> "$tmp/updated.tsv"
+  # Nothing happened on this pull request since the last look.
+  [ "$(lookup "$cache_updated" "$url" 2)" = "$updated" ] && continue
+
   path=${url#https://github.com/}
   repo=${path%/pull/*}
   num=${path##*/}
@@ -81,43 +109,69 @@ while IFS=$'\t' read -r url title; do
 
   # An empty COMMENTED review is only the wrapper around inline comments, which
   # are reported one by one below.
-  gh api "repos/$repo/pulls/$num/reviews" 2> /dev/null |
-    jq -r --arg me "$me" --arg since "$since" --arg pr "$pr" --arg t "$title" '
-      .[]
-      | select(.user.login != $me and .submitted_at > $since)
-      | select(.state != "COMMENTED" or (.body // "") != "")
-      | [ .html_url,
-          .user.login + " " + (
-            if .state == "APPROVED" then "approved"
-            elif .state == "CHANGES_REQUESTED" then "requested changes on"
-            else "reviewed" end) + " " + $pr,
-          (if (.body // "") == "" then $t else .body[0:150] end) ]
-      | @tsv' >> "$events"
+  {
+    gh api "repos/$repo/pulls/$num/reviews" 2> /dev/null |
+      jq -r --arg me "$me" --arg since "$since" --arg pr "$pr" --arg t "$title" --arg bots "$bots" '
+        .[]
+        | select(.user.login != $me and .submitted_at > $since)
+        | select($bots == "1" or .user.type != "Bot")
+        | select(.state != "COMMENTED" or (.body // "") != "")
+        | [ .html_url,
+            .user.login + " " + (
+              if .state == "APPROVED" then "approved"
+              elif .state == "CHANGES_REQUESTED" then "requested changes on"
+              else "reviewed" end) + " " + $pr,
+            (if (.body // "") == "" then $t else .body[0:150] end) ]
+        | @tsv'
 
-  # Comments on the conversation tab.
-  gh api "repos/$repo/issues/$num/comments?since=$since&per_page=100" 2> /dev/null |
-    jq -r --arg me "$me" --arg pr "$pr" '
-      .[]
-      | select(.user.login != $me)
-      | [.html_url, .user.login + " commented on " + $pr, .body[0:150]]
-      | @tsv' >> "$events"
+    # Comments on the conversation tab.
+    gh api "repos/$repo/issues/$num/comments?since=$since&per_page=100" 2> /dev/null |
+      jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
+        .[]
+        | select(.user.login != $me)
+        | select($bots == "1" or .user.type != "Bot")
+        | [.html_url, .user.login + " commented on " + $pr, .body[0:150]]
+        | @tsv'
 
-  # Inline comments on the diff.
-  gh api "repos/$repo/pulls/$num/comments?since=$since&per_page=100" 2> /dev/null |
-    jq -r --arg me "$me" --arg pr "$pr" '
-      .[]
-      | select(.user.login != $me)
-      | [.html_url, .user.login + " commented on " + $pr, (.path // "") + ": " + .body[0:120]]
-      | @tsv' >> "$events"
+    # Inline comments on the diff.
+    gh api "repos/$repo/pulls/$num/comments?since=$since&per_page=100" 2> /dev/null |
+      jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
+        .[]
+        | select(.user.login != $me)
+        | select($bots == "1" or .user.type != "Bot")
+        | [.html_url, .user.login + " commented on " + $pr, (.path // "") + ": " + .body[0:120]]
+        | @tsv'
+  } >> "$events"
 done < "$tmp/prs.tsv"
+mv "$tmp/updated.tsv" "$cache_updated"
 
+: > "$tmp/new.tsv"
 while IFS=$'\t' read -r key title message; do
   [ -z "${key:-}" ] && continue
   grep -qxF "$key" "$state" && continue
   printf '%s\n' "$key" >> "$state"
-  [ "$first_run" = 1 ] && continue
-  notify "$title" "${message//\\n/ }" "${key%#review-requested}"
+  printf '%s\t%s\t%s\n' "$key" "$title" "$message" >> "$tmp/new.tsv"
 done < "$events"
+
+# A reviewer who leaves ten inline comments in one go gets one notification.
+if [ "$first_run" = 0 ]; then
+  awk -F'\t' '{ split($1, a, "#"); print a[1] }' "$tmp/new.tsv" | sort | uniq -c |
+    while read -r count url; do
+      if [ "$count" -gt 4 ]; then
+        path=${url#https://github.com/}
+        pr="${path%/pull/*}"
+        pr="${pr#*/}#${path##*/}"
+        who=$(awk -F'\t' -v u="$url#" 'index($1, u) == 1 { print $2 }' "$tmp/new.tsv" |
+          awk '{ print ($1 == "Review") ? $4 : $1 }' | sort -u | paste -sd "," - | sed 's/,/, /g')
+        notify "$count new comments on $pr" "$who" "$url"
+      else
+        awk -F'\t' -v u="$url#" 'index($1, u) == 1' "$tmp/new.tsv" |
+          while IFS=$'\t' read -r key title message; do
+            notify "$title" "${message//\\n/ }" "${key%#review-requested}"
+          done
+      fi
+    done
+fi
 
 tail -n 3000 "$state" > "$state.trim" && mv "$state.trim" "$state"
 
