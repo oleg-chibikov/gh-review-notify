@@ -1,0 +1,125 @@
+#!/bin/bash
+# macOS notification for every review and comment someone else leaves on a pull
+# request you authored, take part in, or were asked to review.
+set -uo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export GH_PAGER=cat
+
+days=${GH_REVIEW_NOTIFY_DAYS:-3}
+state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/gh-review-notify"
+state="$state_dir/seen.txt"
+
+notify() { # title, message, url
+  if command -v terminal-notifier > /dev/null; then
+    terminal-notifier -title "$1" -message "$2" -open "$3" -group "$3" -sound Glass > /dev/null 2>&1
+  else
+    osascript -e "display notification \"${2//\"/ }\" with title \"${1//\"/ }\"" > /dev/null 2>&1
+  fi
+}
+
+if [ "${1:-}" = "--test" ]; then
+  notify "gh-review-notify" "Notifications are working" "https://github.com/notifications"
+  echo "Sent a test notification. Nothing on screen means macOS is blocking it:"
+  echo "System Settings > Notifications > terminal-notifier > Allow notifications."
+  exit 0
+fi
+
+command -v gh > /dev/null || { echo "gh is not installed" >&2; exit 1; }
+command -v jq > /dev/null || { echo "jq is not installed" >&2; exit 1; }
+
+mkdir -p "$state_dir"
+first_run=0
+if [ ! -f "$state" ]; then
+  first_run=1
+  : > "$state"
+fi
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+events="$tmp/events.tsv"
+: > "$events"
+
+me=$(gh api user --jq .login) || { echo "gh is not logged in: run gh auth login" >&2; exit 1; }
+since=$(date -u -v-"${days}"d +%Y-%m-%dT%H:%M:%SZ)
+day=$(date -u -v-"${days}"d +%Y-%m-%d)
+
+search_prs() {
+  gh search prs "$@" --state open --updated ">=$day" --limit 30 --json url,title
+}
+
+requested_from_me() {
+  local path=${1#https://github.com/}
+  gh api "repos/${path%/pull/*}/pulls/${path##*/}" --jq '.requested_reviewers[].login' 2> /dev/null |
+    grep -qxF "$me"
+}
+
+{
+  search_prs --author @me
+  search_prs --involves @me
+  search_prs --reviewed-by @me
+} 2> /dev/null | jq -rs 'add | unique_by(.url) | .[] | [.url, .title] | @tsv' > "$tmp/base.tsv"
+
+# review-requested also matches a request sent to a team you belong to, so every
+# hit is checked for your own name on the PR.
+gh search prs --review-requested @me --state open --limit 30 --json url,title,author --jq \
+  '.[] | [.url, .title, .author.login] | @tsv' > "$tmp/requested.tsv" 2> /dev/null
+
+: > "$tmp/personal.tsv"
+while IFS=$'\t' read -r url title author; do
+  requested_from_me "$url" || continue
+  printf '%s\t%s\n' "$url" "$title" >> "$tmp/personal.tsv"
+  printf '%s#review-requested\tReview requested by %s\t%s\n' "$url" "$author" "$title" >> "$events"
+done < "$tmp/requested.tsv"
+
+sort -u "$tmp/base.tsv" "$tmp/personal.tsv" > "$tmp/prs.tsv"
+
+while IFS=$'\t' read -r url title; do
+  path=${url#https://github.com/}
+  repo=${path%/pull/*}
+  num=${path##*/}
+  pr="${repo#*/}#$num"
+
+  # An empty COMMENTED review is only the wrapper around inline comments, which
+  # are reported one by one below.
+  gh api "repos/$repo/pulls/$num/reviews" 2> /dev/null |
+    jq -r --arg me "$me" --arg since "$since" --arg pr "$pr" --arg t "$title" '
+      .[]
+      | select(.user.login != $me and .submitted_at > $since)
+      | select(.state != "COMMENTED" or (.body // "") != "")
+      | [ .html_url,
+          .user.login + " " + (
+            if .state == "APPROVED" then "approved"
+            elif .state == "CHANGES_REQUESTED" then "requested changes on"
+            else "reviewed" end) + " " + $pr,
+          (if (.body // "") == "" then $t else .body[0:150] end) ]
+      | @tsv' >> "$events"
+
+  # Comments on the conversation tab.
+  gh api "repos/$repo/issues/$num/comments?since=$since&per_page=100" 2> /dev/null |
+    jq -r --arg me "$me" --arg pr "$pr" '
+      .[]
+      | select(.user.login != $me)
+      | [.html_url, .user.login + " commented on " + $pr, .body[0:150]]
+      | @tsv' >> "$events"
+
+  # Inline comments on the diff.
+  gh api "repos/$repo/pulls/$num/comments?since=$since&per_page=100" 2> /dev/null |
+    jq -r --arg me "$me" --arg pr "$pr" '
+      .[]
+      | select(.user.login != $me)
+      | [.html_url, .user.login + " commented on " + $pr, (.path // "") + ": " + .body[0:120]]
+      | @tsv' >> "$events"
+done < "$tmp/prs.tsv"
+
+while IFS=$'\t' read -r key title message; do
+  [ -z "${key:-}" ] && continue
+  grep -qxF "$key" "$state" && continue
+  printf '%s\n' "$key" >> "$state"
+  [ "$first_run" = 1 ] && continue
+  notify "$title" "${message//\\n/ }" "${key%#review-requested}"
+done < "$events"
+
+tail -n 3000 "$state" > "$state.trim" && mv "$state.trim" "$state"
+
+[ "$first_run" = 1 ] && echo "Seeded $(wc -l < "$state" | tr -d ' ') past events. Only new ones will pop up."
+exit 0
