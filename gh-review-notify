@@ -10,16 +10,47 @@ bots=${GH_REVIEW_NOTIFY_BOTS:-0}
 state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/gh-review-notify"
 state="$state_dir/seen.txt"
 
-notify() { # title, message, url
+notify() { # title, subtitle, message, url
   if command -v terminal-notifier > /dev/null; then
-    terminal-notifier -title "$1" -message "$2" -open "$3" -group "$3" -sound Glass > /dev/null 2>&1
+    terminal-notifier -title "$1" -subtitle "$2" -message "$3" -open "$4" -group "$4" -sound Glass > /dev/null 2>&1
   else
-    osascript -e "display notification \"${2//\"/ }\" with title \"${1//\"/ }\"" > /dev/null 2>&1
+    osascript -e "display notification \"${3//\"/ }\" with title \"${1//\"/ }\" subtitle \"${2//\"/ }\"" > /dev/null 2>&1
   fi
 }
 
+badge() { # event kind
+  case "$1" in
+    approved) echo "✅ Approved" ;;
+    changes) echo "⛔️ Changes requested" ;;
+    request) echo "👀 Review requested" ;;
+    review) echo "📝 Review" ;;
+    *) echo "💬 Comment" ;;
+  esac
+}
+
+clock() { # ISO 8601 UTC
+  local epoch
+  epoch=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2> /dev/null) || return 0
+  if [ "$(date -r "$epoch" +%F)" = "$(date +%F)" ]; then
+    date -r "$epoch" +%H:%M
+  else
+    date -r "$epoch" '+%b %-d, %H:%M'
+  fi
+}
+
+byline() { # who, PR author, ISO 8601 UTC
+  local whose time
+  case "$2" in
+    "") whose="" ;;
+    "$me") whose="your PR" ;;
+    *) whose="$2's PR" ;;
+  esac
+  time=$(clock "$3")
+  printf '%s%s%s' "$1" "${whose:+ · $whose}" "${time:+ · $time}"
+}
+
 if [ "${1:-}" = "--test" ]; then
-  notify "gh-review-notify" "Notifications are working" "https://github.com/notifications"
+  notify "gh-review-notify" "$(date +%H:%M)" "Notifications are working" "https://github.com/notifications"
   echo "Sent a test notification. Nothing on screen means macOS is blocking it:"
   echo "System Settings > Notifications > terminal-notifier > Allow notifications."
   exit 0
@@ -68,7 +99,7 @@ since=$(date -u -v-"${days}"d +%Y-%m-%dT%H:%M:%SZ)
 day=$(date -u -v-"${days}"d +%Y-%m-%d)
 
 search_prs() {
-  gh search prs "$@" --state open --updated ">=$day" --limit 100 --json url,title,updatedAt
+  gh search prs "$@" --state open --updated ">=$day" --limit 100 --json url,title,updatedAt,author
 }
 
 requested_from_me() {
@@ -81,7 +112,8 @@ requested_from_me() {
   search_prs --author @me
   search_prs --involves @me
   search_prs --reviewed-by @me
-} 2> /dev/null | jq -rs 'add | unique_by(.url) | .[] | [.url, .title, .updatedAt] | @tsv' > "$tmp/base.tsv"
+} 2> /dev/null |
+  jq -rs 'add | unique_by(.url) | .[] | [.url, .title, .updatedAt, .author.login] | @tsv' > "$tmp/base.tsv"
 
 # review-requested also matches a request sent to a team you belong to, so every
 # hit is checked for your own name on the PR. The answer is kept until the pull
@@ -99,15 +131,18 @@ while IFS=$'\t' read -r url title author updated; do
   fi
   printf '%s\t%s\t%s\n' "$url" "$updated" "$verdict" >> "$tmp/requests.tsv"
   [ "$verdict" = "personal" ] || continue
-  printf '%s\t%s\t%s\n' "$url" "$title" "$updated" >> "$tmp/personal.tsv"
-  printf '%s#review-requested\tReview requested by %s\t%s\n' "$url" "$author" "$title" >> "$events"
+  printf '%s\t%s\t%s\t%s\n' "$url" "$title" "$updated" "$author" >> "$tmp/personal.tsv"
+  path=${url#https://github.com/}
+  repo=${path%/pull/*}
+  printf '%s#review-requested\trequest\t%s\t%s\t%s\t%s\t%s\n' \
+    "$url" "$updated" "$author" "${repo#*/}#${path##*/}" "$author" "$title" >> "$events"
 done < "$tmp/requested.tsv"
 mv "$tmp/requests.tsv" "$cache_requests"
 
 sort -t$'\t' -k1,1 -u "$tmp/base.tsv" "$tmp/personal.tsv" > "$tmp/prs.tsv"
 
 : > "$tmp/updated.tsv"
-while IFS=$'\t' read -r url title updated; do
+while IFS=$'\t' read -r url title updated owner; do
   # Nothing happened on this pull request since the last look.
   if [ "$(lookup "$cache_updated" "$url" 2)" = "$updated" ]; then
     printf '%s\t%s\n' "$url" "$updated" >> "$tmp/updated.tsv"
@@ -127,33 +162,36 @@ while IFS=$'\t' read -r url title updated; do
   # An empty COMMENTED review is only the wrapper around inline comments, which
   # are reported one by one below.
   {
-    jq -r --arg me "$me" --arg since "$since" --arg pr "$pr" --arg t "$title" --arg bots "$bots" '
+    jq -r --arg me "$me" --arg since "$since" --arg pr "$pr" --arg t "$title" --arg bots "$bots" --arg owner "$owner" '
       .[]
       | select(.user.login != $me and .submitted_at > $since)
       | select($bots == "1" or .user.type != "Bot")
       | select(.state != "COMMENTED" or (.body // "") != "")
       | [ .html_url,
-          .user.login + " " + (
-            if .state == "APPROVED" then "approved"
-            elif .state == "CHANGES_REQUESTED" then "requested changes on"
-            else "reviewed" end) + " " + $pr,
+          (if .state == "APPROVED" then "approved"
+           elif .state == "CHANGES_REQUESTED" then "changes"
+           else "review" end),
+          .submitted_at,
+          .user.login,
+          $pr,
+          $owner,
           (if (.body // "") == "" then $t else .body[0:150] end) ]
       | @tsv' "$tmp/reviews.json" 2> /dev/null
 
     # Comments on the conversation tab.
-    jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
+    jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" --arg owner "$owner" '
       .[]
       | select(.user.login != $me)
       | select($bots == "1" or .user.type != "Bot")
-      | [.html_url, .user.login + " commented on " + $pr, .body[0:150]]
+      | [.html_url, "comment", .created_at, .user.login, $pr, $owner, .body[0:150]]
       | @tsv' "$tmp/issue.json" 2> /dev/null
 
     # Inline comments on the diff.
-    jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" '
+    jq -r --arg me "$me" --arg pr "$pr" --arg bots "$bots" --arg owner "$owner" '
       .[]
       | select(.user.login != $me)
       | select($bots == "1" or .user.type != "Bot")
-      | [.html_url, .user.login + " commented on " + $pr, (.path // "") + ": " + .body[0:120]]
+      | [.html_url, "comment", .created_at, .user.login, $pr, $owner, (.path // "") + ": " + .body[0:120]]
       | @tsv' "$tmp/inline.json" 2> /dev/null
   } >> "$events"
 
@@ -164,29 +202,40 @@ done < "$tmp/prs.tsv"
 mv "$tmp/updated.tsv" "$cache_updated"
 
 : > "$tmp/new.tsv"
-while IFS=$'\t' read -r key title message; do
+while IFS=$'\t' read -r key kind when actor pr owner message; do
   [ -z "${key:-}" ] && continue
   grep -qxF "$key" "$state" && continue
   printf '%s\n' "$key" >> "$state"
-  printf '%s\t%s\t%s\n' "$key" "$title" "$message" >> "$tmp/new.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "$kind" "$when" "$actor" "$pr" "$owner" "$message" >> "$tmp/new.tsv"
 done < "$events"
 
-# A reviewer who leaves ten inline comments in one go gets one notification.
 if [ "$first_run" = 0 ]; then
-  awk -F'\t' '{ split($1, a, "#"); print a[1] }' "$tmp/new.tsv" | sort | uniq -c |
+  # An approval or a change request always arrives on its own, so it can't get
+  # lost inside a pile of comments.
+  awk -F'\t' '$2 != "comment"' "$tmp/new.tsv" > "$tmp/single.tsv"
+  awk -F'\t' '$2 == "comment"' "$tmp/new.tsv" > "$tmp/comments.tsv"
+
+  while IFS=$'\t' read -r key kind when actor pr owner message; do
+    notify "$(badge "$kind") · $pr" "$(byline "$actor" "$owner" "$when")" \
+      "${message//\\n/ }" "${key%#review-requested}"
+  done < "$tmp/single.tsv"
+
+  # A reviewer who leaves ten inline comments in one go gets one notification.
+  awk -F'\t' '{ split($1, a, "#"); print a[1] }' "$tmp/comments.tsv" | sort | uniq -c |
     while read -r count url; do
+      rows="$tmp/rows.tsv"
+      awk -F'\t' -v u="$url#" 'index($1, u) == 1' "$tmp/comments.tsv" > "$rows"
       if [ "$count" -gt 4 ]; then
-        path=${url#https://github.com/}
-        pr="${path%/pull/*}"
-        pr="${pr#*/}#${path##*/}"
-        who=$(awk -F'\t' -v u="$url#" 'index($1, u) == 1 { print $2 }' "$tmp/new.tsv" |
-          awk '{ print ($1 == "Review") ? $4 : $1 }' | sort -u | paste -sd "," - | sed 's/,/, /g')
-        notify "$count new comments on $pr" "$who" "$url"
+        last=$(sort -t$'\t' -k3,3 "$rows" | tail -1)
+        who=$(cut -f4 "$rows" | sort -u | paste -sd "," - | sed 's/,/, /g')
+        notify "💬 $count new comments · $(cut -f5 <<< "$last")" \
+          "$(byline "$who" "$(cut -f6 <<< "$last")" "$(cut -f3 <<< "$last")")" \
+          "$(cut -f7 <<< "$last")" "$url"
       else
-        awk -F'\t' -v u="$url#" 'index($1, u) == 1' "$tmp/new.tsv" |
-          while IFS=$'\t' read -r key title message; do
-            notify "$title" "${message//\\n/ }" "${key%#review-requested}"
-          done
+        while IFS=$'\t' read -r key kind when actor pr owner message; do
+          notify "$(badge "$kind") · $pr" "$(byline "$actor" "$owner" "$when")" \
+            "${message//\\n/ }" "$key"
+        done < "$rows"
       fi
     done
 fi

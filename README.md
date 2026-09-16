@@ -24,7 +24,20 @@ the pull requests you are part of:
 
 For each one it reads the reviews, the conversation comments and the inline
 comments on the diff, drops what you wrote yourself and what it has already
-shown, and pops the rest. The notification opens the exact comment:
+shown, and pops the rest.
+
+A notification looks like this:
+
+```
+✅ Approved · api-users#570
+alice · your PR · 14:32
+LGTM
+```
+
+The first line says what happened: ✅ approved, ⛔️ changes requested, 👀 review
+requested, 📝 review, 💬 comment. The second line gives the person, whose pull
+request it is, and the time in your timezone. Older than today, and the date
+comes with it: `Sep 15, 18:04`. Click it and the exact comment opens:
 `.../pull/42#discussion_r123`.
 
 It stays quiet about:
@@ -37,8 +50,9 @@ It stays quiet about:
 - your own comments, closed PRs, CI.
 
 Ten inline comments from one reviewer arrive as a single notification. Past four
-new items on the same PR they collapse into "7 new comments on api-users#570"
-with the names underneath.
+new comments on the same PR they collapse into "💬 7 new comments ·
+api-users#570" with the names underneath. An approval or a change request always
+comes on its own, so it can't get buried in the pile.
 
 The first run records the last 3 days silently, so you skip the wall of old
 notifications. What it has shown lives in `~/.cache/gh-review-notify/seen.txt`.
